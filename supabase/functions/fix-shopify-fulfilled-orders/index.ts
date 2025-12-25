@@ -1,0 +1,129 @@
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.50.2';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+
+    console.log('Starting fix for orders incorrectly marked as delivered...');
+
+    // Find all orders that are marked 'delivered' but have no tracking_id
+    // These are likely orders that were auto-marked delivered due to Shopify fulfillment
+    // (They have a courier but were never actually confirmed delivered by courier API)
+    const { data: affectedOrders, error: fetchError } = await supabaseAdmin
+      .from('orders')
+      .select('id, order_number, status, tags, shopify_order_id, courier')
+      .eq('status', 'delivered')
+      .is('tracking_id', null);
+
+    if (fetchError) {
+      console.error('Error fetching affected orders:', fetchError);
+      throw fetchError;
+    }
+
+    if (!affectedOrders || affectedOrders.length === 0) {
+      console.log('No affected orders found');
+      return new Response(
+        JSON.stringify({ 
+          success: true, 
+          message: 'No orders need fixing',
+          ordersFixed: 0 
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log(`Found ${affectedOrders.length} orders to fix`);
+
+    // Fix each order
+    let successCount = 0;
+    let errorCount = 0;
+    const errors: any[] = [];
+
+    for (const order of affectedOrders) {
+      try {
+        // Update status to dispatched (since they have courier) and add 'Shopify - Fulfilled' tag
+        const currentTags = order.tags || [];
+        const updatedTags = currentTags.includes('Shopify - Fulfilled') 
+          ? currentTags 
+          : [...currentTags, 'Shopify - Fulfilled'];
+
+        // Replace 'Ecomnet - Delivered' tag with 'Ecomnet - Dispatched'
+        const finalTags = updatedTags.map(tag => 
+          tag === 'Ecomnet - Delivered' ? 'Ecomnet - Dispatched' : tag
+        );
+
+        const { error: updateError } = await supabaseAdmin
+          .from('orders')
+          .update({
+            status: 'dispatched',
+            tags: finalTags,
+            delivered_at: null,
+          })
+          .eq('id', order.id);
+
+        if (updateError) {
+          console.error(`Error updating order ${order.order_number}:`, updateError);
+          errorCount++;
+          errors.push({ order_number: order.order_number, error: updateError.message });
+          continue;
+        }
+
+        // Log the fix
+        await supabaseAdmin
+          .from('activity_logs')
+          .insert({
+            action: 'order_status_corrected',
+            entity_type: 'order',
+            entity_id: order.id,
+            details: {
+              order_number: order.order_number,
+              previous_status: 'delivered',
+              new_status: 'dispatched',
+              reason: 'Fixed incorrect delivered status - no tracking confirmation from courier',
+              courier: order.courier,
+              shopify_fulfilled_tag_added: !currentTags.includes('Shopify - Fulfilled'),
+            },
+            user_id: '00000000-0000-0000-0000-000000000000', // System user
+          });
+
+        successCount++;
+        console.log(`Fixed order ${order.order_number}`);
+      } catch (orderError: any) {
+        console.error(`Exception fixing order ${order.order_number}:`, orderError);
+        errorCount++;
+        errors.push({ order_number: order.order_number, error: orderError.message });
+      }
+    }
+
+    console.log(`Fix complete: ${successCount} orders fixed, ${errorCount} errors`);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        message: `Fixed ${successCount} orders`,
+        ordersFixed: successCount,
+        totalFound: affectedOrders.length,
+        errors: errorCount > 0 ? errors : undefined,
+      }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  } catch (error: any) {
+    console.error('Error in fix-shopify-fulfilled-orders:', error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+});

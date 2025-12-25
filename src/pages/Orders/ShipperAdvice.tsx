@@ -1,0 +1,811 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Search, Filter, Download, Eye, MessageSquare, RotateCcw, Undo2, Loader2 } from "lucide-react";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import TagsNotes from "@/components/TagsNotes";
+import { supabase } from '@/integrations/supabase/client';
+import { useToast } from '@/hooks/use-toast';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+const ShipperAdvice = () => {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedOrders, setSelectedOrders] = useState<string[]>([]);
+  const [expandedRows, setExpandedRows] = useState<string[]>([]);
+  const [orders, setOrders] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [courierFilter, setCourierFilter] = useState<string>('all');
+  const [attemptsFilter, setAttemptsFilter] = useState<string>('all');
+  const [availableCouriers, setAvailableCouriers] = useState<string[]>([]);
+  const [couriersWithAdviceSupport, setCouriersWithAdviceSupport] = useState<Set<string>>(new Set());
+  const [processingAdvice, setProcessingAdvice] = useState<string | null>(null);
+  const [bulkProcessing, setBulkProcessing] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    open: boolean;
+    type: 'reattempt' | 'return';
+    orderId?: string;
+    isBulk: boolean;
+  }>({ open: false, type: 'reattempt', isBulk: false });
+  const { toast } = useToast();
+
+  useEffect(() => {
+    const fetchProblematicOrders = async () => {
+      setLoading(true);
+      try {
+        console.log('=== SHIPPER ADVICE DEBUG START ===');
+        
+        // Step 1: Fetch dispatched orders (WITHOUT nested query)
+        const { data: ordersData, error: ordersError } = await supabase
+          .from('orders')
+          .select('id, order_number, status, customer_name, customer_phone, customer_address, city, tracking_id, courier, total_amount, created_at')
+          .in('status', ['dispatched', 'returned'])
+          .not('tracking_id', 'is', null)
+          .order('created_at', { ascending: false });
+
+        if (ordersError) {
+          console.error('Error fetching orders:', ordersError);
+          toast({
+            title: "Error",
+            description: "Failed to fetch orders",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        console.log('Step 1 - Orders fetched:', ordersData?.length || 0);
+
+        if (!ordersData || ordersData.length === 0) {
+          console.log('No dispatched/returned orders found');
+          setOrders([]);
+          return;
+        }
+
+        const orderIds = ordersData.map(o => o.id);
+
+        // Step 2: Fetch dispatches in chunks to avoid URL length limits
+        const dispatchByOrderId = new Map<string, any>();
+        const CHUNK_SIZE = 100;
+        
+        for (let i = 0; i < orderIds.length; i += CHUNK_SIZE) {
+          const chunk = orderIds.slice(i, i + CHUNK_SIZE);
+          const { data: dispatchesData, error: dispatchesError } = await supabase
+            .from('dispatches')
+            .select('id, order_id, tracking_id, courier, dispatch_date')
+            .in('order_id', chunk);
+
+          if (dispatchesError) {
+            console.error('Error fetching dispatches chunk:', dispatchesError);
+            continue;
+          }
+
+          (dispatchesData || []).forEach(d => {
+            dispatchByOrderId.set(d.order_id, d);
+          });
+        }
+
+        console.log('Step 2 - Dispatches fetched:', dispatchByOrderId.size);
+
+        // Step 3: Fetch tracking history using order_id directly (courier_tracking_history has order_id column)
+        const trackingByOrderId = new Map<string, any[]>();
+        
+        for (let i = 0; i < orderIds.length; i += CHUNK_SIZE) {
+          const chunk = orderIds.slice(i, i + CHUNK_SIZE);
+          const { data: trackingData, error: trackingError } = await supabase
+            .from('courier_tracking_history')
+            .select('id, order_id, tracking_id, status, current_location, checked_at')
+            .in('order_id', chunk);
+
+          if (trackingError) {
+            console.error('Error fetching tracking history:', trackingError);
+            continue;
+          }
+
+          (trackingData || []).forEach((track: any) => {
+            const existing = trackingByOrderId.get(track.order_id) || [];
+            existing.push(track);
+            trackingByOrderId.set(track.order_id, existing);
+          });
+        }
+
+        console.log('Step 3 - Orders with tracking history:', trackingByOrderId.size);
+
+        // Step 4: Fetch existing shipper advice logs
+        const { data: adviceLogs } = await supabase
+          .from('shipper_advice_logs')
+          .select('order_id, status')
+          .in('status', ['pending', 'submitted']);
+
+        const ordersWithPendingAdvice = new Set(
+          (adviceLogs || []).map(log => log.order_id)
+        );
+
+        console.log('Step 4 - Orders with pending advice:', ordersWithPendingAdvice.size);
+
+        // Statuses that indicate parcel needs shipper advice (expanded to catch all couriers)
+        const needsAdviceStatuses = [
+          'delivery_failed',   // Leopard
+          'returned',          // All couriers
+          'failed',            // Common alternative
+          'undelivered',       // TCS/PostEx possible
+          'rto',               // Return to Origin
+          'not_delivered',     // Alternative naming
+          'refused',           // Customer refused
+          'RO',                // TCS returned status
+          'delivery_attempt_failed', // Alternative
+          'consignee_refused', // PostEx
+          'address_issue',     // Address problems
+          'customer_not_available', // Customer unavailable
+        ];
+
+        // Step 5: Filter and format orders
+        let filteredCount = 0;
+        let noTrackingCount = 0;
+        let hasAdviceCount = 0;
+        let wrongStatusCount = 0;
+        
+        const formattedOrders = ordersData
+          .filter(order => {
+            // Must have tracking_id
+            if (!order.tracking_id) {
+              return false;
+            }
+            
+            // Check for pending advice
+            if (ordersWithPendingAdvice.has(order.id)) {
+              hasAdviceCount++;
+              return false;
+            }
+            
+            // Get tracking history
+            const trackingHistory = trackingByOrderId.get(order.id) || [];
+            if (trackingHistory.length === 0) {
+              noTrackingCount++;
+              return false;
+            }
+            
+            const latestTracking = [...trackingHistory].sort(
+              (a, b) => new Date(b.checked_at).getTime() - new Date(a.checked_at).getTime()
+            )[0];
+            
+            // Check if status needs advice
+            if (!needsAdviceStatuses.includes(latestTracking.status)) {
+              wrongStatusCount++;
+              return false;
+            }
+            
+            filteredCount++;
+            return true;
+          })
+          .map((order) => {
+            const dispatch = dispatchByOrderId.get(order.id);
+            const trackingHistory = trackingByOrderId.get(order.id) || [];
+            
+            const sortedHistory = [...trackingHistory].sort(
+              (a, b) => new Date(b.checked_at).getTime() - new Date(a.checked_at).getTime()
+            );
+            
+            const latestTracking = sortedHistory[0];
+            
+            const attemptStatuses = ['out_for_delivery', 'delivery_failed', 'attempted'];
+            const attemptCount = trackingHistory.filter(h => 
+              attemptStatuses.includes(h.status)
+            ).length;
+            
+            const lastUpdate = new Date(latestTracking.checked_at);
+            const daysStuck = Math.floor((Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24));
+            
+            return {
+              id: order.id,
+              orderNumber: order.order_number,
+              trackingId: order.tracking_id,
+              customerName: order.customer_name,
+              customerPhone: order.customer_phone,
+              address: order.customer_address,
+              city: order.city,
+              status: latestTracking.status,
+              courier: order.courier || 'Unknown',
+              courierName: dispatch?.courier || order.courier,
+              attemptDate: latestTracking.checked_at.split('T')[0],
+              attemptCount: attemptCount || 1,
+              lastAttemptReason: latestTracking.current_location || 'Unknown reason',
+              totalAmount: order.total_amount || 0,
+              daysStuck: daysStuck
+            };
+          });
+
+        console.log('=== SHIPPER ADVICE DEBUG RESULTS ===');
+        console.log('Total orders:', ordersData.length);
+        console.log('Orders with no tracking:', noTrackingCount);
+        console.log('Orders with pending advice:', hasAdviceCount);
+        console.log('Orders with wrong status:', wrongStatusCount);
+        console.log('Final filtered orders:', filteredCount);
+        console.log('=== DEBUG END ===');
+
+        setOrders(formattedOrders);
+      } catch (error) {
+        console.error('Error:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    const fetchCouriers = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('couriers')
+          .select('name, code, shipper_advice_save_endpoint')
+          .eq('is_active', true)
+          .order('name');
+
+        if (error) throw error;
+        
+        if (data) {
+          setAvailableCouriers(data.map(c => c.name));
+          // Track which couriers have shipper advice endpoint configured
+          const supportedCouriers = new Set<string>();
+          data.forEach(c => {
+            if (c.shipper_advice_save_endpoint) {
+              supportedCouriers.add(c.code?.toLowerCase() || '');
+              supportedCouriers.add(c.name?.toLowerCase() || '');
+            }
+          });
+          setCouriersWithAdviceSupport(supportedCouriers);
+        }
+      } catch (error) {
+        console.error('Error fetching couriers:', error);
+      }
+    };
+
+    fetchProblematicOrders();
+    fetchCouriers();
+  }, [toast]);
+
+  const filteredOrders = useMemo(() => {
+    return orders.filter(order => {
+      const matchesSearch = 
+        order.orderNumber.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        order.customerName.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        order.customerPhone.includes(searchTerm);
+      
+      // Compare courier code (lowercase) with filter value (also lowercase)
+      const orderCourierCode = (order.courier || '').toLowerCase();
+      const matchesCourier = courierFilter === 'all' || 
+        orderCourierCode === courierFilter.toLowerCase() ||
+        order.courierName?.toLowerCase() === courierFilter.toLowerCase();
+      
+      const matchesAttempts = 
+        attemptsFilter === 'all' || 
+        (attemptsFilter === '1' && order.attemptCount === 1) ||
+        (attemptsFilter === '2' && order.attemptCount === 2) ||
+        (attemptsFilter === '3+' && order.attemptCount >= 3);
+      
+      return matchesSearch && matchesCourier && matchesAttempts;
+    });
+  }, [orders, searchTerm, courierFilter, attemptsFilter]);
+
+  const handleSelectOrder = (orderId: string, checked: boolean) => {
+    if (checked) {
+      setSelectedOrders([...selectedOrders, orderId]);
+    } else {
+      setSelectedOrders(selectedOrders.filter(id => id !== orderId));
+    }
+  };
+
+  const handleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedOrders(filteredOrders.map(order => order.id));
+    } else {
+      setSelectedOrders([]);
+    }
+  };
+
+  const handleExportSelected = () => {
+    const selectedData = filteredOrders.filter(order => selectedOrders.includes(order.id));
+    const csvContent = [
+      ['Order Number', 'Customer Name', 'Phone', 'Status', 'Courier', 'Attempts', 'Days Stuck', 'Amount'],
+      ...selectedData.map(order => [
+        order.orderNumber,
+        order.customerName,
+        order.customerPhone,
+        order.status,
+        order.courier,
+        order.attemptCount.toString(),
+        order.daysStuck.toString(),
+        `₨${order.totalAmount.toLocaleString()}`
+      ])
+    ].map(row => row.join(',')).join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `shipper-advice-${new Date().toISOString().split('T')[0]}.csv`;
+    link.click();
+  };
+
+  const handleViewOrder = (orderId: string) => {
+    // For now, we'll show an alert. In a real app, this would navigate to order details
+    alert(`Viewing order details for ${orderId}`);
+  };
+
+  const handleWhatsApp = (phone: string) => {
+    // Open WhatsApp with phone number
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+    window.open(`https://wa.me/${cleanPhone}`, '_blank');
+  };
+
+  const toggleRowExpansion = (orderId: string) => {
+    setExpandedRows(prev => 
+      prev.includes(orderId) 
+        ? prev.filter(id => id !== orderId)
+        : [...prev, orderId]
+    );
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'delivery_failed':
+        return 'bg-red-100 text-red-800 border-red-200';
+      case 'pending':
+        return 'bg-yellow-100 text-yellow-800 border-yellow-200';
+      case 'out_for_delivery':
+        return 'bg-blue-100 text-blue-800 border-blue-200';
+      case 'attempted':
+        return 'bg-orange-100 text-orange-800 border-orange-200';
+      default:
+        return 'bg-gray-100 text-gray-800 border-gray-200';
+    }
+  };
+
+  const getPriorityColor = (daysStuck: number) => {
+    if (daysStuck >= 7) return 'text-red-600 font-semibold';
+    if (daysStuck >= 3) return 'text-orange-600 font-medium';
+    return 'text-green-600';
+  };
+
+  // Check if courier supports shipper advice API
+  const courierSupportsAdvice = (courierCode: string) => {
+    return couriersWithAdviceSupport.has(courierCode?.toLowerCase() || '');
+  };
+
+  // Get selected orders that support shipper advice
+  const selectedOrdersWithAdviceSupport = useMemo(() => {
+    return selectedOrders.filter(orderId => {
+      const order = orders.find(o => o.id === orderId);
+      return order && courierSupportsAdvice(order.courier);
+    });
+  }, [selectedOrders, orders, couriersWithAdviceSupport]);
+
+  const handleShipperAdvice = async (orderId: string, adviceType: 'reattempt' | 'return') => {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+
+    setProcessingAdvice(orderId);
+    try {
+      const { data, error } = await supabase.functions.invoke('shipper-advice', {
+        body: {
+          trackingId: order.trackingId,
+          courierCode: order.courier?.toLowerCase(),
+          adviceType,
+          remarks: `${adviceType === 'reattempt' ? 'Please reattempt delivery' : 'Please return to origin'} - ${order.lastAttemptReason}`
+        }
+      });
+
+      if (error) throw error;
+
+      toast({
+        title: "Advice Submitted",
+        description: `${adviceType === 'reattempt' ? 'Reattempt' : 'Return'} advice sent to ${order.courier} for ${order.orderNumber}`,
+      });
+
+      // Remove from list after successful submission
+      setOrders(prev => prev.filter(o => o.id !== orderId));
+      setSelectedOrders(prev => prev.filter(id => id !== orderId));
+    } catch (error: any) {
+      console.error('Shipper advice error:', error);
+      toast({
+        title: "Error",
+        description: error.message || "Failed to submit shipper advice",
+        variant: "destructive",
+      });
+    } finally {
+      setProcessingAdvice(null);
+    }
+  };
+
+  const handleBulkAdvice = async (adviceType: 'reattempt' | 'return') => {
+    if (selectedOrdersWithAdviceSupport.length === 0) return;
+
+    setBulkProcessing(true);
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const orderId of selectedOrdersWithAdviceSupport) {
+      const order = orders.find(o => o.id === orderId);
+      if (!order) continue;
+
+      try {
+        const { error } = await supabase.functions.invoke('shipper-advice', {
+          body: {
+            trackingId: order.trackingId,
+            courierCode: order.courier?.toLowerCase(),
+            adviceType,
+            remarks: `${adviceType === 'reattempt' ? 'Please reattempt delivery' : 'Please return to origin'} - ${order.lastAttemptReason}`
+          }
+        });
+
+        if (error) throw error;
+        successCount++;
+      } catch (error) {
+        console.error(`Failed for order ${order.orderNumber}:`, error);
+        failCount++;
+      }
+    }
+
+    toast({
+      title: "Bulk Advice Complete",
+      description: `${successCount} successful, ${failCount} failed`,
+      variant: failCount > 0 ? "destructive" : "default",
+    });
+
+    // Remove successful orders from list
+    if (successCount > 0) {
+      setOrders(prev => prev.filter(o => !selectedOrdersWithAdviceSupport.includes(o.id) || failCount > 0));
+      setSelectedOrders([]);
+    }
+    setBulkProcessing(false);
+  };
+
+  const confirmAdvice = (type: 'reattempt' | 'return', orderId?: string) => {
+    setConfirmDialog({
+      open: true,
+      type,
+      orderId,
+      isBulk: !orderId
+    });
+  };
+
+  const executeConfirmedAdvice = () => {
+    if (confirmDialog.isBulk) {
+      handleBulkAdvice(confirmDialog.type);
+    } else if (confirmDialog.orderId) {
+      handleShipperAdvice(confirmDialog.orderId, confirmDialog.type);
+    }
+    setConfirmDialog({ open: false, type: 'reattempt', isBulk: false });
+  };
+
+  return (
+    <div className="p-6 space-y-6">
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold text-foreground">Parcels Waiting for Shipper Advice</h1>
+          <p className="text-muted-foreground mt-1">Orders with failed deliveries that need reattempt, return, or reschedule instructions</p>
+        </div>
+        <div className="flex gap-2">
+          {selectedOrdersWithAdviceSupport.length > 0 && (
+            <>
+              <Button
+                variant="default"
+                onClick={() => confirmAdvice('reattempt')}
+                disabled={bulkProcessing}
+              >
+                {bulkProcessing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RotateCcw className="h-4 w-4 mr-2" />}
+                Bulk Reattempt ({selectedOrdersWithAdviceSupport.length})
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => confirmAdvice('return')}
+                disabled={bulkProcessing}
+              >
+                {bulkProcessing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Undo2 className="h-4 w-4 mr-2" />}
+                Bulk Return ({selectedOrdersWithAdviceSupport.length})
+              </Button>
+            </>
+          )}
+          <Button variant="outline" disabled={selectedOrders.length === 0} onClick={handleExportSelected}>
+            <Download className="h-4 w-4 mr-2" />
+            Export
+          </Button>
+        </div>
+      </div>
+
+      {/* Stats Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">Awaiting Advice</p>
+                <p className="text-2xl font-bold text-foreground">{filteredOrders.length}</p>
+              </div>
+              <div className="h-8 w-8 bg-destructive/10 rounded-lg flex items-center justify-center">
+                <Filter className="h-4 w-4 text-destructive" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">High Priority (7+ days)</p>
+                <p className="text-2xl font-bold text-destructive">
+                  {filteredOrders.filter(order => order.daysStuck >= 7).length}
+                </p>
+              </div>
+              <div className="h-8 w-8 bg-destructive/10 rounded-lg flex items-center justify-center">
+                <MessageSquare className="h-4 w-4 text-destructive" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">Multiple Attempts</p>
+                <p className="text-2xl font-bold text-orange-600">
+                  {filteredOrders.filter(order => order.attemptCount > 2).length}
+                </p>
+              </div>
+              <div className="h-8 w-8 bg-orange-100 rounded-lg flex items-center justify-center">
+                <MessageSquare className="h-4 w-4 text-orange-600" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">Total Value at Risk</p>
+                <p className="text-2xl font-bold text-green-600">
+                  ₨{filteredOrders.reduce((sum, order) => sum + order.totalAmount, 0).toLocaleString()}
+                </p>
+              </div>
+              <div className="h-8 w-8 bg-green-100 rounded-lg flex items-center justify-center">
+                <Eye className="h-4 w-4 text-green-600" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Main Content */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Orders Requiring Attention</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {/* Search and Filters */}
+          <div className="flex flex-col sm:flex-row gap-4 mb-6">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 h-4 w-4" />
+              <Input
+                placeholder="Search by order number, customer name, or phone..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="pl-10"
+              />
+            </div>
+            <Select value={courierFilter} onValueChange={setCourierFilter}>
+              <SelectTrigger className="w-full sm:w-[180px]">
+                <SelectValue placeholder="All Couriers" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Couriers</SelectItem>
+                {availableCouriers.map((courier) => (
+                  <SelectItem key={courier} value={courier}>
+                    {courier}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={attemptsFilter} onValueChange={setAttemptsFilter}>
+              <SelectTrigger className="w-full sm:w-[180px]">
+                <SelectValue placeholder="All Attempts" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Attempts</SelectItem>
+                <SelectItem value="1">1 Attempt</SelectItem>
+                <SelectItem value="2">2 Attempts</SelectItem>
+                <SelectItem value="3+">3+ Attempts</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Table */}
+          <div className="overflow-x-auto -mx-6 px-6">
+            <Table className="min-w-[1300px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-12">
+                    <Checkbox
+                      checked={selectedOrders.length === filteredOrders.length && filteredOrders.length > 0}
+                      onCheckedChange={handleSelectAll}
+                    />
+                  </TableHead>
+                  <TableHead>Order #</TableHead>
+                  <TableHead>Tracking ID</TableHead>
+                  <TableHead>Customer</TableHead>
+                  <TableHead>City</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Courier</TableHead>
+                  <TableHead>Attempts</TableHead>
+                  <TableHead>Reason</TableHead>
+                  <TableHead>Days Stuck</TableHead>
+                  <TableHead>Amount</TableHead>
+                  <TableHead>Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+               <TableBody>
+                 {loading ? (
+                   <TableRow>
+                     <TableCell colSpan={12} className="text-center py-8 text-muted-foreground">Loading parcels...</TableCell>
+                   </TableRow>
+                 ) : filteredOrders.length === 0 ? (
+                   <TableRow>
+                     <TableCell colSpan={12} className="text-center py-8 text-muted-foreground">
+                       No parcels waiting for shipper advice
+                     </TableCell>
+                   </TableRow>
+                 ) : (
+                   filteredOrders.map((order) => (
+                     <React.Fragment key={order.id}>
+                       <TableRow className="hover:bg-muted/50">
+                         <TableCell>
+                           <Checkbox
+                             checked={selectedOrders.includes(order.id)}
+                             onCheckedChange={(checked) => handleSelectOrder(order.id, checked as boolean)}
+                           />
+                         </TableCell>
+                         <TableCell className="font-medium">{order.orderNumber}</TableCell>
+                         <TableCell className="font-mono text-xs">{order.trackingId}</TableCell>
+                         <TableCell>
+                           <div>
+                             <p className="font-medium">{order.customerName}</p>
+                             <p className="text-xs text-muted-foreground">{order.customerPhone}</p>
+                           </div>
+                         </TableCell>
+                         <TableCell>{order.city || '-'}</TableCell>
+                         <TableCell>
+                           <Badge className={`${getStatusColor(order.status)} capitalize`}>
+                             {order.status.replace(/_/g, ' ')}
+                           </Badge>
+                         </TableCell>
+                         <TableCell>{order.courier}</TableCell>
+                         <TableCell>
+                           <span className={order.attemptCount > 2 ? 'text-destructive font-semibold' : ''}>
+                             {order.attemptCount}
+                           </span>
+                         </TableCell>
+                         <TableCell className="max-w-[150px] truncate text-muted-foreground text-sm">
+                           {order.lastAttemptReason}
+                         </TableCell>
+                         <TableCell>
+                           <span className={getPriorityColor(order.daysStuck)}>
+                             {order.daysStuck} days
+                           </span>
+                         </TableCell>
+                         <TableCell className="font-medium">₨{order.totalAmount.toLocaleString()}</TableCell>
+                          <TableCell>
+                            <div className="flex gap-1">
+                              {courierSupportsAdvice(order.courier) ? (
+                                <>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => confirmAdvice('reattempt', order.id)}
+                                    disabled={processingAdvice === order.id}
+                                    title="Reattempt Delivery"
+                                  >
+                                    {processingAdvice === order.id ? (
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <RotateCcw className="h-3 w-3" />
+                                    )}
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => confirmAdvice('return', order.id)}
+                                    disabled={processingAdvice === order.id}
+                                    title="Return to Origin"
+                                    className="text-destructive hover:text-destructive"
+                                  >
+                                    <Undo2 className="h-3 w-3" />
+                                  </Button>
+                                </>
+                              ) : (
+                                <span className="text-xs text-muted-foreground italic">No API</span>
+                              )}
+                              <Button variant="outline" size="sm" onClick={() => toggleRowExpansion(order.id)} title="View Details">
+                                <Eye className="h-3 w-3" />
+                              </Button>
+                              <Button variant="outline" size="sm" onClick={() => handleWhatsApp(order.customerPhone)} title="WhatsApp">
+                                <MessageSquare className="h-3 w-3" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                       </TableRow>
+                       {expandedRows.includes(order.id) && (
+                         <TableRow>
+                           <TableCell colSpan={12} className="bg-muted/30">
+                             <div className="p-4 space-y-4">
+                               <div className="grid grid-cols-2 gap-4 text-sm">
+                                 <div>
+                                   <span className="text-muted-foreground">Full Address:</span>
+                                   <p className="font-medium">{order.address || 'N/A'}</p>
+                                 </div>
+                                 <div>
+                                   <span className="text-muted-foreground">Last Attempt Date:</span>
+                                   <p className="font-medium">{order.attemptDate}</p>
+                                 </div>
+                               </div>
+                               <TagsNotes
+                                 itemId={order.id}
+                                 tags={[]}
+                                 notes={[]}
+                                 onAddTag={(tag) => {/* Add tag functionality */}}
+                                 onAddNote={(note) => {/* Add note functionality */}}
+                                 onDeleteTag={(tagId) => {/* Delete tag functionality */}}
+                                 onDeleteNote={(noteId) => {/* Delete note functionality */}}
+                               />
+                             </div>
+                           </TableCell>
+                         </TableRow>
+                       )}
+                     </React.Fragment>
+                   ))
+                 )}
+               </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Confirmation Dialog */}
+      <AlertDialog open={confirmDialog.open} onOpenChange={(open) => setConfirmDialog(prev => ({ ...prev, open }))}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Confirm {confirmDialog.type === 'reattempt' ? 'Reattempt' : 'Return'} Advice
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmDialog.isBulk
+                ? `This will send ${confirmDialog.type} advice to couriers for ${selectedOrders.length} selected order(s). This action cannot be undone.`
+                : `This will send ${confirmDialog.type} advice to the courier. This action cannot be undone.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={executeConfirmedAdvice}
+              className={confirmDialog.type === 'return' ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90' : ''}
+            >
+              {confirmDialog.type === 'reattempt' ? 'Reattempt' : 'Return'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+};
+
+export default ShipperAdvice;
